@@ -16,18 +16,20 @@ hands = mp_hands.Hands(
 mp_draw = mp.solutions.drawing_utils
 cap = cv2.VideoCapture(0)
 
-# 🔥 MAKE WINDOW BIG + RESIZABLE
+# Window
 cv2.namedWindow("Finger Drawing", cv2.WINDOW_NORMAL)
 cv2.resizeWindow("Finger Drawing", 1280, 720)
 
 points = []
-MIN_DISTANCE = 15
+MIN_DISTANCE = 5
 
 robot_buffer = []
 last_buffer_time = time.time()
-BUFFER_INTERVAL = 2.0
+BUFFER_INTERVAL = 1.5
 
 robot_data = {"angle": 0, "distance": 0}
+
+
 last_vector = None
 
 
@@ -35,13 +37,11 @@ last_vector = None
 
 def fingers_up(handLms):
     fingers = []
-
     fingers.append(handLms.landmark[8].y < handLms.landmark[6].y)
     fingers.append(handLms.landmark[12].y < handLms.landmark[10].y)
     fingers.append(handLms.landmark[16].y < handLms.landmark[14].y)
     fingers.append(handLms.landmark[20].y < handLms.landmark[18].y)
     fingers.append(handLms.landmark[4].x > handLms.landmark[3].x)
-
     return fingers
 
 
@@ -67,29 +67,28 @@ def angle_between(v1, v2):
     return round(math.degrees(math.acos(cos_theta)), 2)
 
 
+# ✅ FIXED FUNCTION
 def calculate_path_stats(point_list):
     global last_vector
 
     if len(point_list) < 2:
         return {"angle": 0, "distance": 0}
 
-    total_distance = sum(
-        euclidean_distance(point_list[i-1], point_list[i])
-        for i in range(1, len(point_list))
-    )
+    # ONLY last segment distance
+    distance = euclidean_distance(point_list[-2], point_list[-1])
 
     current_vector = vector(point_list[-2], point_list[-1])
 
     if last_vector is None:
         last_vector = current_vector
-        return {"angle": 0, "distance": total_distance}
+        return {"angle": 0, "distance": round(distance, 2)}
 
     angle = angle_between(last_vector, current_vector)
     last_vector = current_vector
 
     return {
         "angle": angle,
-        "distance": round(total_distance, 2)
+        "distance": round(distance, 2)
     }
 
 
@@ -101,8 +100,6 @@ while cap.isOpened():
         continue
 
     img = cv2.flip(img, 1)
-
-    # 🔥 MAKE CAMERA IMAGE BIGGER
     img = cv2.resize(img, (1280, 720))
 
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -123,12 +120,14 @@ while cap.isOpened():
             index_up = fingers[0]
             all_up = all(fingers)
 
+            # ✏️ DRAW MODE (only index finger)
             if index_up and not any(fingers[1:4]):
                 draw_mode = True
 
                 if len(points) == 0 or euclidean_distance((x, y), points[-1]) >= MIN_DISTANCE:
                     points.append((x, y))
 
+            # 🧹 CLEAR when hand open
             if all_up:
                 points = []
                 robot_data = {"angle": 0, "distance": 0}
@@ -137,6 +136,7 @@ while cap.isOpened():
             cv2.circle(img, (x, y), 20, (0, 255, 0), cv2.FILLED)
             mp_draw.draw_landmarks(img, handLms, mp_hands.HAND_CONNECTIONS)
 
+    # 🤖 SEND DATA
     if draw_mode and current_time - last_buffer_time >= BUFFER_INTERVAL:
         if len(points) >= 2:
             robot_data = calculate_path_stats(points)
@@ -151,9 +151,11 @@ while cap.isOpened():
 
             print(f"ANGLE={robot_data['angle']}° | DIST={robot_data['distance']} px")
 
+    # 🎨 DRAW PATH
     for i in range(1, len(points)):
         cv2.line(img, points[i-1], points[i], (255, 0, 0), 3)
 
+    # UI
     mode_text = "DRAWING" if draw_mode else "NOT DRAWING"
     cv2.putText(img, mode_text, (10, 50),
                 cv2.FONT_HERSHEY_SIMPLEX, 1,
