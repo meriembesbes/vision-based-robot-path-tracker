@@ -316,8 +316,19 @@ while cap.isOpened():
         for i in range(1, len(simplified)):
             cv2.line(img, simplified[i-1], simplified[i], (220, 80, 60), 3)
 
-        if last_heading:
-            draw_arrow(img, raw_points[-1], last_heading)
+        # Arrow follows the LAST DRAWN SEGMENT direction
+        if len(raw_points) >= 2:
+            p1 = raw_points[-2]
+            p2 = raw_points[-1]
+
+            dx = p2[0] - p1[0]
+            dy = p2[1] - p1[1]
+
+            seg_vec = normalize((dx, dy))
+
+            if seg_vec:
+                draw_arrow(img, p2, seg_vec)
+
 
     for seg in segments:
         if seg["vec_in"] and seg["vec_out"]:
