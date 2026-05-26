@@ -30,7 +30,6 @@ def open_camera():
         for backend in backends:
             cap = cv2.VideoCapture(idx, backend)
             if cap.isOpened():
-                # Warm up: wait until we actually get a frame
                 for _ in range(5):
                     ret, frame = cap.read()
                     if ret and frame is not None:
@@ -159,43 +158,82 @@ def draw_angle_arc(img, pt, v1, v2, angle_deg, color=(50, 230, 120)):
     cv2.putText(img, f"{sign}{angle_deg:.1f}", (lx-10, ly),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 2)
 
-def draw_ui_panel(img, draw_mode, live_heading, live_turn, segs):
+def draw_ui_panel(img, draw_mode, segs):
     h, w = img.shape[:2]
+
+    # ── Semi-transparent left panel ──
     overlay = img.copy()
-    cv2.rectangle(overlay, (0, 0), (310, h), (15, 15, 20), -1)
+    cv2.rectangle(overlay, (0, 0), (330, h), (15, 15, 20), -1)
     cv2.addWeighted(overlay, 0.55, img, 0.45, 0, img)
 
+    # ── Status badge ──
     status_col = (0, 210, 80) if draw_mode else (0, 80, 220)
-    cv2.rectangle(img, (10, 10), (300, 50), status_col, -1)
+    cv2.rectangle(img, (10, 10), (320, 50), status_col, -1)
     label = "  DRAWING" if draw_mode else "  IDLE"
-    cv2.putText(img, label, (14, 38), cv2.FONT_HERSHEY_DUPLEX, 0.9, (255,255,255), 2)
+    cv2.putText(img, label, (14, 38), cv2.FONT_HERSHEY_DUPLEX, 0.9, (255, 255, 255), 2)
 
-    y = 80
-    for title, val in [
-        ("Heading",  f"{live_heading:+.1f}°"),
-        ("Turn",     f"{live_turn:+.1f}°"),
-        ("Segments", str(len(segs))),
-    ]:
-        cv2.putText(img, title, (14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (160,160,180), 1)
-        cv2.putText(img, val,   (160, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (240,220,100), 2)
-        y += 34
+    y = 70
 
-    cv2.line(img, (10, y), (300, y), (60, 60, 80), 1)
-    y += 20
-    cv2.putText(img, "Segment Log", (14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (120,180,255), 1)
+    # ── Latest segment: angle + length (always visible at top) ──
+    cv2.putText(img, "Last Segment", (14, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (120, 180, 255), 1)
     y += 26
-    for seg in segs[-8:]:
-        turn_sign = "L" if seg["turn_deg"] >= 0 else "R"
-        line = (f"#{seg['id']:02d}  hdg={seg['heading_deg']:+.0f}  "
-                f"turn={turn_sign}{abs(seg['turn_deg']):.0f}  d={seg['dist_px']:.0f}px")
-        col  = (100, 220, 100) if seg["turn_deg"] >= 0 else (100, 140, 255)
-        cv2.putText(img, line, (14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, col, 1)
+
+    if segs:
+        last = segs[-1]
+        turn = last["turn_deg"]
+        turn_dir = "L" if turn >= 0 else "R"
+        angle_color = (100, 220, 100) if turn >= 0 else (100, 140, 255)
+
+        cv2.putText(img, "Angle :", (14, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, (160, 160, 180), 1)
+        cv2.putText(img, f"{turn_dir}  {abs(turn):.1f} deg", (110, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, angle_color, 2)
+        y += 30
+
+        cv2.putText(img, "Length:", (14, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, (160, 160, 180), 1)
+        cv2.putText(img, f"{last['dist_px']:.1f} px", (110, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (240, 220, 100), 2)
+        y += 30
+    else:
+        cv2.putText(img, "No segment yet", (14, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 120), 1)
+        y += 30
+
+    # ── Divider ──
+    cv2.line(img, (10, y), (320, y), (60, 60, 80), 1)
+    y += 16
+
+    # ── Running history of all segments ──
+    cv2.putText(img, "Segment History", (14, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (120, 180, 255), 1)
+    y += 26
+
+    row_h = 46   # height per history entry
+    max_rows = (h - y - 30) // row_h
+    visible = segs[-max_rows:] if len(segs) > max_rows else segs
+
+    for seg in visible:
+        turn     = seg["turn_deg"]
+        turn_dir = "L" if turn >= 0 else "R"
+        angle_color = (100, 220, 100) if turn >= 0 else (100, 140, 255)
+
+        # segment id + angle
+        cv2.putText(img, f"#{seg['id']:02d}  Angle: {turn_dir} {abs(turn):.1f} deg", (14, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, angle_color, 1)
         y += 22
+        # length on second line, indented
+        cv2.putText(img, f"      Length: {seg['dist_px']:.1f} px", (14, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (240, 220, 100), 1)
+        y += row_h - 22
+
         if y > h - 30:
             break
 
+    # ── Footer hint ──
     cv2.putText(img, "Open hand = clear  |  ESC = quit",
-                (12, h-12), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (90,90,110), 1)
+                (12, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (90, 90, 110), 1)
 
 # ─────────────────────────────────────────────
 #  SEGMENT LOGIC
@@ -251,7 +289,6 @@ while cap.isOpened():
 
     img = cv2.flip(img, 1)
 
-    # Resize only if needed (avoids error if frame is already 1280x720)
     h_raw, w_raw = img.shape[:2]
     if (w_raw, h_raw) != (1280, 720):
         img = cv2.resize(img, (1280, 720))
@@ -316,19 +353,14 @@ while cap.isOpened():
         for i in range(1, len(simplified)):
             cv2.line(img, simplified[i-1], simplified[i], (220, 80, 60), 3)
 
-        # Arrow follows the LAST DRAWN SEGMENT direction
         if len(raw_points) >= 2:
             p1 = raw_points[-2]
             p2 = raw_points[-1]
-
             dx = p2[0] - p1[0]
             dy = p2[1] - p1[1]
-
             seg_vec = normalize((dx, dy))
-
             if seg_vec:
                 draw_arrow(img, p2, seg_vec)
-
 
     for seg in segments:
         if seg["vec_in"] and seg["vec_out"]:
@@ -336,11 +368,11 @@ while cap.isOpened():
             draw_angle_arc(img, pt, seg["vec_in"], seg["vec_out"], seg["turn_deg"])
             cv2.circle(img, pt, 6, (50, 230, 120), -1)
 
-    draw_ui_panel(img, draw_mode, live_heading_deg, live_turn_deg, segments)
+    draw_ui_panel(img, draw_mode, segments)
 
     cv2.imshow("Robot Path Tracker", img)
     key = cv2.waitKey(1) & 0xFF
-    if key == 27:   # ESC
+    if key == 27:
         break
     if key == ord('q'):
         break
