@@ -1,16 +1,46 @@
-# Assistive Robot (Work in Progress)
+# Vision-based Robot Path Tracker
 
-This is the starting phase of my project to build an assistive robot for disabled people.
+A real-time computer vision system that tracks fingertip motion using MediaPipe and OpenCV to generate smooth robot-like trajectories with angle and segment analysis.
 
-## Current Progress
-- Initial finger tracking code
-- Camera input processing
+## Features
+
+- Real-time hand tracking
+- Fingertip trajectory extraction
+- Motion smoothing
+- Segment detection
+- Turn-angle computation
+- Douglas–Peucker path simplification
+- Dynamic visual overlays
+- Gesture-controlled interaction
+
+## Technologies Used
+
+- Python
+- OpenCV
+- MediaPipe
+- NumPy
+
+## System Pipeline
+Camera Input
+    ↓
+Hand Detection
+    ↓
+Landmark Extraction
+    ↓
+Trajectory Tracking
+    ↓
+Path Smoothing
+    ↓
+Angle Analysis
+    ↓
+Segment Generation
+    ↓
+Visualization
+
+## Demo
+
 
 ## Next Steps
 - Path tracking
 - Communication with ESP32
 - Robot movement control
-
-## Tech Stack
-- Python
-- OpenCV
