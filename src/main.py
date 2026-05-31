@@ -16,13 +16,13 @@ print("Finger tracking started — ESC to quit, open hand to clear")
 # ─────────────────────────────────────────────
 MIN_RECORD_DIST   = 12
 SMOOTH_WINDOW     = 9
-VECTOR_LOOKBACK   = 25
-TURN_THRESHOLD    = 12.0
-MIN_SEG_LENGTH    = 30
+VECTOR_LOOKBACK   = 40
+TURN_THRESHOLD    = 12.0   # degrees — minimum turn to commit a new segment
+MIN_SEG_LENGTH    = 30     # pixels — minimum segment length before checking for turn
 SIMPLIFY_EPS      = 6
 
 # ─────────────────────────────────────────────
-#  CAMERA INIT — robust multi-index attempt
+#  CAMERA INIT
 # ─────────────────────────────────────────────
 def open_camera():
     backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
@@ -43,7 +43,7 @@ def open_camera():
 
 cap = open_camera()
 if cap is None:
-    print("❌ No camera found. Make sure it is connected and not in use by another app.")
+    print("❌ No camera found.")
     exit(1)
 
 # ─────────────────────────────────────────────
@@ -63,14 +63,16 @@ cv2.resizeWindow("Robot Path Tracker", 1280, 720)
 # ─────────────────────────────────────────────
 #  STATE
 # ─────────────────────────────────────────────
-raw_points: list = []
+raw_points: list  = []
 smooth_buf: deque = deque(maxlen=SMOOTH_WINDOW)
+
+# Each segment: { id, start, end, vec, heading_deg, relative_angle_deg, dist_px }
 segments:   list  = []
 
-last_heading    = None
-seg_start_idx   = 0
-live_heading_deg = 0.0
-live_turn_deg    = 0.0
+# The direction vector of the most recently committed segment.
+# New relative angles are measured FROM this vector.
+last_committed_vec = None   # unit vector (dx, dy) of previous segment
+seg_start_idx      = 0      # index into raw_points where current segment began
 
 # ─────────────────────────────────────────────
 #  MATH UTILITIES
@@ -81,20 +83,25 @@ def dist(p1, p2):
 
 def normalize(v):
     mag = math.hypot(v[0], v[1])
-    if mag < 1e-6:
-        return None
-    return (v[0]/mag, v[1]/mag)
+    return (v[0]/mag, v[1]/mag) if mag > 1e-6 else None
 
 def heading_deg(v):
+    """Absolute heading: 0=right, +CCW (screen coords)."""
     return math.degrees(math.atan2(-v[1], v[0]))
 
-def signed_angle_between(v1, v2):
-    dot   = max(-1.0, min(1.0, v1[0]*v2[0] + v1[1]*v2[1]))
-    cross = v1[0]*v2[1] - v1[1]*v2[0]
+def signed_angle_between(v_ref, v_new):
+    """
+    Signed angle from v_ref to v_new.
+    Positive = left turn (CCW on screen), Negative = right turn (CW on screen).
+    Range: (-180, 180].
+    """
+    dot   = max(-1.0, min(1.0, v_ref[0]*v_new[0] + v_ref[1]*v_new[1]))
+    cross = v_ref[0]*v_new[1] - v_ref[1]*v_new[0]
     angle = math.degrees(math.acos(dot))
     return angle if cross >= 0 else -angle
 
 def stable_direction(pts, end_idx, lookback):
+    """Compute a stable direction vector by looking back `lookback` points."""
     start_idx = max(0, end_idx - lookback)
     if start_idx == end_idx:
         return None
@@ -135,6 +142,84 @@ def fingers_up(lms):
     ]
 
 # ─────────────────────────────────────────────
+#  SEGMENT LOGIC
+#
+#  Key idea (matching your schema):
+#    • The FIRST segment has no reference → relative_angle = 0°  (it IS the reference)
+#    • Every subsequent segment's angle is measured relative to the PREVIOUS segment's
+#      direction vector, NOT relative to absolute North/East.
+#    • Straight continuation → 0°
+#    • Left turn → positive degrees
+#    • Right turn → negative degrees
+# ─────────────────────────────────────────────
+
+def try_commit_segment(pts, seg_start, prev_vec):
+    """
+    Returns (segment_dict | None, new_seg_start, new_prev_vec)
+
+    A segment is committed when the finger has travelled far enough AND
+    the current direction differs from prev_vec by more than TURN_THRESHOLD.
+    """
+    end_idx  = len(pts) - 1
+    cur_vec  = stable_direction(pts, end_idx, VECTOR_LOOKBACK)
+    if cur_vec is None:
+        return None, seg_start, prev_vec
+
+    seg_dist = dist(pts[seg_start], pts[end_idx])
+    if seg_dist < MIN_SEG_LENGTH:
+        return None, seg_start, prev_vec
+
+    # ── First segment: no previous vector, just record direction ──
+    if prev_vec is None:
+        seg_id = len(segments) + 1
+        seg = {
+            "id":                   seg_id,
+            "start":                pts[seg_start],
+            "end":                  pts[end_idx],
+            "vec":                  cur_vec,
+            "heading_deg":          round(heading_deg(cur_vec), 1),
+            "relative_angle_deg":   0.0,   # First segment has no turn reference
+            "dist_px":              round(seg_dist, 1),
+        }
+        print(f"[SEG #{seg_id:02d}]  "
+              f"relative_angle=0.0°  "
+              f"heading={seg['heading_deg']:+.1f}°  "
+              f"length={seg['dist_px']:.1f}px")
+        return seg, end_idx, cur_vec
+
+    # ── Compute relative turn angle ──
+    relative_angle = signed_angle_between(prev_vec, cur_vec)
+
+    if abs(relative_angle) < TURN_THRESHOLD:
+        # Still going straight — update direction but don't commit
+        return None, seg_start, cur_vec
+
+    # ── Commit the segment that just ended (from seg_start → end_idx) ──
+    seg_id = len(segments) + 1
+
+    # The segment that is being committed is the one FROM seg_start TO now.
+    # Its own direction is cur_vec (what we measured).
+    # Its relative angle is vs. prev_vec (the previous segment's direction).
+    seg = {
+        "id":                   seg_id,
+        "start":                pts[seg_start],
+        "end":                  pts[end_idx],
+        "vec":                  cur_vec,
+        "heading_deg":          round(heading_deg(cur_vec), 1),
+        "relative_angle_deg":   round(relative_angle, 1),   # ← THIS is θ in your schema
+        "dist_px":              round(seg_dist, 1),
+    }
+
+    direction_label = "L" if relative_angle >= 0 else "R"
+    print(f"[SEG #{seg_id:02d}]  "
+          f"relative_angle={direction_label}{abs(relative_angle):.1f}°  "
+          f"heading={seg['heading_deg']:+.1f}°  "
+          f"length={seg['dist_px']:.1f}px")
+
+    # The committed segment's direction becomes the new reference
+    return seg, end_idx, cur_vec
+
+# ─────────────────────────────────────────────
 #  DRAWING HELPERS
 # ─────────────────────────────────────────────
 
@@ -143,137 +228,124 @@ def draw_arrow(img, origin, direction_unit, length=55, color=(0, 220, 255), thic
            int(origin[1] + direction_unit[1]*length))
     cv2.arrowedLine(img, origin, end, color, thickness, tipLength=0.35)
 
-def draw_angle_arc(img, pt, v1, v2, angle_deg, color=(50, 230, 120)):
-    r  = 38
-    a1 = math.degrees(math.atan2(-v1[1], v1[0]))
-    a2 = math.degrees(math.atan2(-v2[1], v2[0]))
-    sa, ea = sorted([a1, a2])
-    if ea - sa > 180:
-        sa, ea = ea, sa + 360
-    cv2.ellipse(img, pt, (r, r), 0, int(sa), int(ea), color, 2)
+def draw_turn_arc(img, pt, v_in, v_out, angle_deg):
+    """Draw a small arc at a turn point showing the relative angle."""
+    r   = 38
+    a1  = math.degrees(math.atan2(-v_in[1],  v_in[0]))
+    a2  = math.degrees(math.atan2(-v_out[1], v_out[0]))
+
+    # Normalise to [0, 360)
+    a1 %= 360
+    a2 %= 360
+    diff = (a2 - a1 + 360) % 360
+    if diff > 180:
+        sa, ea = int(a2), int(a1)
+    else:
+        sa, ea = int(a1), int(a2)
+
+    color = (100, 220, 100) if angle_deg >= 0 else (100, 140, 255)
+    cv2.ellipse(img, pt, (r, r), 0, sa, ea, color, 2)
+
     mid_rad = math.radians((sa + ea) / 2)
-    lx = int(pt[0] + (r + 18) * math.cos(mid_rad))
-    ly = int(pt[1] - (r + 18) * math.sin(mid_rad))
+    lx = int(pt[0] + (r + 20) * math.cos(mid_rad))
+    ly = int(pt[1] - (r + 20) * math.sin(mid_rad))
     sign = "+" if angle_deg >= 0 else ""
-    cv2.putText(img, f"{sign}{angle_deg:.1f}", (lx-10, ly),
+    cv2.putText(img, f"{sign}{angle_deg:.1f}", (lx-14, ly),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 2)
 
 def draw_ui_panel(img, draw_mode, segs):
     h, w = img.shape[:2]
 
-    # ── Semi-transparent left panel ──
     overlay = img.copy()
-    cv2.rectangle(overlay, (0, 0), (330, h), (15, 15, 20), -1)
+    cv2.rectangle(overlay, (0, 0), (340, h), (15, 15, 20), -1)
     cv2.addWeighted(overlay, 0.55, img, 0.45, 0, img)
 
-    # ── Status badge ──
+    # Status badge
     status_col = (0, 210, 80) if draw_mode else (0, 80, 220)
-    cv2.rectangle(img, (10, 10), (320, 50), status_col, -1)
+    cv2.rectangle(img, (10, 10), (330, 50), status_col, -1)
     label = "  DRAWING" if draw_mode else "  IDLE"
-    cv2.putText(img, label, (14, 38), cv2.FONT_HERSHEY_DUPLEX, 0.9, (255, 255, 255), 2)
+    cv2.putText(img, label, (14, 38), cv2.FONT_HERSHEY_DUPLEX, 0.9, (255,255,255), 2)
 
-    y = 70
+    y = 68
 
-    # ── Latest segment: angle + length (always visible at top) ──
+    # ── Angle legend ──
+    cv2.putText(img, "Relative Angle  (ref = prev seg)", (14, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.44, (180, 180, 200), 1)
+    y += 18
+    cv2.putText(img, "  0°  = straight  |  +L  -R",
+                (14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 140, 160), 1)
+    y += 22
+
+    cv2.line(img, (10, y), (330, y), (60, 60, 80), 1)
+    y += 14
+
+    # ── Latest segment ──
     cv2.putText(img, "Last Segment", (14, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (120, 180, 255), 1)
     y += 26
 
     if segs:
         last = segs[-1]
-        turn = last["turn_deg"]
-        turn_dir = "L" if turn >= 0 else "R"
-        angle_color = (100, 220, 100) if turn >= 0 else (100, 140, 255)
+        ra   = last["relative_angle_deg"]
+        dir_label = "L" if ra >= 0 else "R"
+        angle_color = (100, 220, 100) if ra >= 0 else (100, 140, 255)
 
-        cv2.putText(img, "Angle :", (14, y),
+        cv2.putText(img, "Turn  :", (14, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.58, (160, 160, 180), 1)
-        cv2.putText(img, f"{turn_dir}  {abs(turn):.1f} deg", (110, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, angle_color, 2)
+        cv2.putText(img, f"{dir_label}  {abs(ra):.1f} deg", (110, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.68, angle_color, 2)
         y += 30
 
         cv2.putText(img, "Length:", (14, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.58, (160, 160, 180), 1)
         cv2.putText(img, f"{last['dist_px']:.1f} px", (110, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (240, 220, 100), 2)
-        y += 30
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.68, (240, 220, 100), 2)
+        y += 34
     else:
         cv2.putText(img, "No segment yet", (14, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 120), 1)
-        y += 30
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100,100,120), 1)
+        y += 34
 
-    # ── Divider ──
-    cv2.line(img, (10, y), (320, y), (60, 60, 80), 1)
-    y += 16
+    cv2.line(img, (10, y), (330, y), (60, 60, 80), 1)
+    y += 14
 
-    # ── Running history of all segments ──
+    # ── History ──
     cv2.putText(img, "Segment History", (14, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (120, 180, 255), 1)
     y += 26
 
-    row_h = 46   # height per history entry
-    max_rows = (h - y - 30) // row_h
-    visible = segs[-max_rows:] if len(segs) > max_rows else segs
+    row_h    = 50
+    max_rows = max(1, (h - y - 30) // row_h)
+    visible  = segs[-max_rows:]
 
     for seg in visible:
-        turn     = seg["turn_deg"]
-        turn_dir = "L" if turn >= 0 else "R"
-        angle_color = (100, 220, 100) if turn >= 0 else (100, 140, 255)
+        ra        = seg["relative_angle_deg"]
+        dir_label = "L" if ra >= 0 else "R"
+        angle_col = (100, 220, 100) if ra >= 0 else (100, 140, 255)
 
-        # segment id + angle
-        cv2.putText(img, f"#{seg['id']:02d}  Angle: {turn_dir} {abs(turn):.1f} deg", (14, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, angle_color, 1)
+        cv2.putText(
+            img,
+            f"#{seg['id']:02d}  Turn: {dir_label} {abs(ra):.1f}°",
+            (14, y),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.50, angle_col, 1
+        )
         y += 22
-        # length on second line, indented
-        cv2.putText(img, f"      Length: {seg['dist_px']:.1f} px", (14, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (240, 220, 100), 1)
+        cv2.putText(
+            img,
+            f"      Len: {seg['dist_px']:.1f}px   Hdg: {seg['heading_deg']:+.1f}°",
+            (14, y),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 160), 1
+        )
         y += row_h - 22
-
         if y > h - 30:
             break
 
-    # ── Footer hint ──
     cv2.putText(img, "Open hand = clear  |  ESC = quit",
                 (12, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (90, 90, 110), 1)
 
 # ─────────────────────────────────────────────
-#  SEGMENT LOGIC
-# ─────────────────────────────────────────────
-
-def maybe_commit_segment(pts, seg_start, last_hdg, turn_threshold, min_len):
-    end_idx  = len(pts) - 1
-    cur_vec  = stable_direction(pts, end_idx, VECTOR_LOOKBACK)
-    if cur_vec is None:
-        return None, seg_start, last_hdg
-
-    seg_dist = dist(pts[seg_start], pts[end_idx])
-    if seg_dist < min_len:
-        return None, seg_start, last_hdg
-
-    if last_hdg is None:
-        return None, seg_start, cur_vec
-
-    turn = signed_angle_between(last_hdg, cur_vec)
-    if abs(turn) < turn_threshold:
-        return None, seg_start, last_hdg
-
-    seg = {
-        "id":          len(segments) + 1,
-        "start":       pts[seg_start],
-        "end":         pts[end_idx],
-        "heading_deg": round(heading_deg(cur_vec), 1),
-        "turn_deg":    round(turn, 1),
-        "dist_px":     round(seg_dist, 1),
-        "vec_in":      last_hdg,
-        "vec_out":     cur_vec,
-    }
-    print(f"[SEG #{seg['id']}]  heading={seg['heading_deg']:+.1f}°  "
-          f"turn={'L' if turn>=0 else 'R'}{abs(turn):.1f}°  dist={seg['dist_px']:.1f}px")
-    return seg, end_idx, cur_vec
-
-# ─────────────────────────────────────────────
 #  MAIN LOOP
 # ─────────────────────────────────────────────
-
 consecutive_failures = 0
 
 while cap.isOpened():
@@ -288,7 +360,6 @@ while cap.isOpened():
     consecutive_failures = 0
 
     img = cv2.flip(img, 1)
-
     h_raw, w_raw = img.shape[:2]
     if (w_raw, h_raw) != (1280, 720):
         img = cv2.resize(img, (1280, 720))
@@ -320,16 +391,8 @@ while cap.isOpened():
                 if len(raw_points) == 0 or dist(pos, raw_points[-1]) >= MIN_RECORD_DIST:
                     raw_points.append(pos)
 
-                    if len(raw_points) >= VECTOR_LOOKBACK:
-                        cur_vec = stable_direction(raw_points, len(raw_points)-1, VECTOR_LOOKBACK)
-                        if cur_vec:
-                            live_heading_deg = heading_deg(cur_vec)
-                            if last_heading:
-                                live_turn_deg = signed_angle_between(last_heading, cur_vec)
-
-                    new_seg, seg_start_idx, last_heading = maybe_commit_segment(
-                        raw_points, seg_start_idx, last_heading,
-                        TURN_THRESHOLD, MIN_SEG_LENGTH
+                    new_seg, seg_start_idx, last_committed_vec = try_commit_segment(
+                        raw_points, seg_start_idx, last_committed_vec
                     )
                     if new_seg:
                         segments.append(new_seg)
@@ -338,43 +401,55 @@ while cap.isOpened():
                 raw_points.clear()
                 smooth_buf.clear()
                 segments.clear()
-                last_heading      = None
-                seg_start_idx     = 0
-                live_heading_deg  = 0.0
-                live_turn_deg     = 0.0
+                last_committed_vec = None
+                seg_start_idx      = 0
                 print("─── PATH CLEARED ───")
 
             cv2.circle(img, pos, 16, (0, 255, 80), cv2.FILLED)
             cv2.circle(img, pos, 16, (0, 140, 40), 2)
             mp_draw.draw_landmarks(img, lms, mp_hands.HAND_CONNECTIONS)
 
+    # ── Draw path ──
     if len(raw_points) >= 2:
         simplified = douglas_peucker(raw_points, SIMPLIFY_EPS)
         for i in range(1, len(simplified)):
             cv2.line(img, simplified[i-1], simplified[i], (220, 80, 60), 3)
 
-        if len(raw_points) >= 2:
-            p1 = raw_points[-2]
-            p2 = raw_points[-1]
-            dx = p2[0] - p1[0]
-            dy = p2[1] - p1[1]
-            seg_vec = normalize((dx, dy))
-            if seg_vec:
-                draw_arrow(img, p2, seg_vec)
+        p1 = raw_points[-2]
+        p2 = raw_points[-1]
+        seg_vec = normalize((p2[0]-p1[0], p2[1]-p1[1]))
+        if seg_vec:
+            draw_arrow(img, p2, seg_vec)
 
-    for seg in segments:
-        if seg["vec_in"] and seg["vec_out"]:
-            pt = seg["end"]
-            draw_angle_arc(img, pt, seg["vec_in"], seg["vec_out"], seg["turn_deg"])
-            cv2.circle(img, pt, 6, (50, 230, 120), -1)
+    # ── Annotate turn points ──
+    for i, seg in enumerate(segments):
+        pt = seg["end"]
+        cv2.circle(img, pt, 7, (50, 230, 120), -1)
+
+        # Draw the arc showing θ (relative angle)
+        if i > 0:
+            prev_vec = segments[i-1]["vec"]
+            draw_turn_arc(img, pt, prev_vec, seg["vec"], seg["relative_angle_deg"])
+        elif i == 0:
+            # First committed segment — show its absolute heading only
+            pass
+
+        # Label with θ symbol + value
+        ra        = seg["relative_angle_deg"]
+        dir_label = "L" if ra >= 0 else "R"
+        angle_col = (100, 220, 100) if ra >= 0 else (100, 140, 255)
+        cv2.putText(
+            img,
+            f"\u03b8{seg['id']}={dir_label}{abs(ra):.0f}",
+            (pt[0] + 12, pt[1] - 12),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, angle_col, 2
+        )
 
     draw_ui_panel(img, draw_mode, segments)
 
     cv2.imshow("Robot Path Tracker", img)
     key = cv2.waitKey(1) & 0xFF
-    if key == 27:
-        break
-    if key == ord('q'):
+    if key in (27, ord('q')):
         break
 
 cap.release()
